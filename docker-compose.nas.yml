@@ -1,0 +1,98 @@
+# VaultPilot AI — Production UGOS Container Station Deployment Configuration
+# Target Hardware: UGREEN AI NAS (UGOS Pro / Docker Engine)
+# Verification Status: Syntactically Validated; Awaiting Physical NAS Window (Nov 22–28, 2026)
+# Security Standard: Read-only container rootfs, unprivileged non-root execution (UID 1000),
+#                    all Linux capabilities dropped, kernel-enforced read-only bind mount.
+
+version: '3.8'
+
+services:
+  vaultpilot-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: ${VAULTPILOT_BACKEND_IMAGE:-vaultpilot-backend:round2-latest}
+    container_name: vaultpilot-backend
+    restart: unless-stopped
+    user: "1000:1000" # Non-root unprivileged NAS user
+    read_only: true # Read-only container rootfs
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      # Operating storage mode (physical_nas enforces volume mount verification)
+      - STORAGE_MODE=${STORAGE_MODE:-physical_nas}
+      - UGREEN_NAS_MODE=${UGREEN_NAS_MODE:-real}
+      - UGREEN_NAS_ROOT=${UGREEN_NAS_ROOT:-/volume1/NGO_Projects}
+      # Database stored on separate writable application volume
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////vaultpilot_data/vaultpilot.db}
+      # Resource bounds to prevent denial-of-service on local NAS hardware
+      - MAX_DISCOVERY_FILES=${MAX_DISCOVERY_FILES:-500}
+      - MAX_DISCOVERY_DEPTH=${MAX_DISCOVERY_DEPTH:-5}
+      - MAX_FILE_SIZE_BYTES=${MAX_FILE_SIZE_BYTES:-26214400}
+      # Secret key for HMAC-SHA256 audit trail attestation (must be overridden in production)
+      - AUDIT_SECRET_KEY=${AUDIT_SECRET_KEY:-vaultpilot-nas-audit-secret-key-change-in-production}
+    volumes:
+      # KERNEL-ENFORCED STRICT READ-ONLY BIND MOUNT OF SOURCE DOCUMENTS
+      - type: bind
+        source: ${UGREEN_NAS_ROOT:-/volume1/NGO_Projects}
+        target: ${UGREEN_NAS_ROOT:-/volume1/NGO_Projects}
+        read_only: true
+      # PERSISTENT APPLICATION DATABASE & AUDIT LEDGER (Writable internal storage)
+      - type: volume
+        source: vaultpilot_data
+        target: /vaultpilot_data
+      # IN-MEMORY TEMPORARY STORAGE (Size-constrained, volatile, no disk leaks)
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 64M
+          mode: 1777
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/projects"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  vaultpilot-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: ${VAULTPILOT_FRONTEND_IMAGE:-vaultpilot-frontend:round2-latest}
+    container_name: vaultpilot-frontend
+    restart: unless-stopped
+    user: "1000:1000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      # Volatile in-memory scratch space for Nginx runtime state
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 16M
+          mode: 1777
+      - type: tmpfs
+        target: /var/cache/nginx
+        tmpfs:
+          size: 16M
+          mode: 1777
+      - type: tmpfs
+        target: /var/run
+        tmpfs:
+          size: 16M
+          mode: 1777
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      - vaultpilot-backend
+
+volumes:
+  vaultpilot_data:
+    driver: local

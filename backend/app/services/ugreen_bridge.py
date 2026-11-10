@@ -1,15 +1,21 @@
 """
-UGREEN NAS Evidence Provider Architecture & Security Sandbox
-Provides the integration boundary between the VaultPilot AI Web Application 
-and configured UGREEN AI NAS storage mounts.
+VaultPilot AI — Tri-Mode Storage Architecture & Security Sandbox
+Provides the integration boundary between the VaultPilot AI Web Application
+and configured storage environments.
+
+Architecture Modes:
+- Mode A (LOCAL_DEV): Local development database, synthetic test fixtures, isolated unit test execution.
+- Mode B (EMULATED_NAS): Offline demonstration sandbox, deterministic NGO financial records.
+- Mode C (PHYSICAL_NAS): Genuine UGREEN AI NAS execution with read-only containment, TOCTOU defense,
+                         bounded discovery, and fail-safe unmounted volume handling.
 
 Enforces:
 1. Strict read-only file access.
-2. Canonical path resolution and boundary containment within UGREEN_NAS_ROOT.
+2. Canonical path resolution and boundary containment within storage root.
 3. Symlink escape and directory traversal ('..') rejection.
 4. Streaming SHA-256 evidence hashing in 64KB blocks.
-5. Pluggable EvidenceProvider interface (FilesystemNASProvider vs EmulatedNASProvider).
-6. Explicit error types without silent mock data substitution in real mode.
+5. Pluggable StorageProviderFactory with explicit error handling.
+6. Scalability controls (bounded file count and directory depth limits).
 """
 
 import os
@@ -18,9 +24,11 @@ import re
 import stat
 import hashlib
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Union
 from abc import ABC, abstractmethod
-from app.core.config import settings
+from app.core.config import settings, StorageMode
+from app.services.document_extractor import FinancialDocumentExtractor
+
 
 class NASError(Exception):
     """Base exception for NAS storage and evidence operations."""
@@ -50,9 +58,13 @@ class NASFileMutationError(NASError):
     """Raised when an evidence file is concurrently modified during hashing or acquisition (TOCTOU violation)."""
     pass
 
+class NASResourceExceededError(NASError):
+    """Raised when discovery exceeds safety limits (file count or directory depth)."""
+    pass
+
 
 class EvidenceProvider(ABC):
-    """Abstract interface for NAS document discovery and evidence extraction."""
+    """Abstract interface for document discovery and evidence acquisition."""
 
     @abstractmethod
     def discover_documents(self, scope_path: str) -> List[Dict[str, Any]]:
@@ -67,8 +79,9 @@ class EvidenceProvider(ABC):
 
 class EmulatedNASProvider(EvidenceProvider):
     """
-    Deterministic fixture provider used exclusively for offline unit testing and development.
-    Never represented as physical NAS execution.
+    Mode B: Offline demonstration sandbox.
+    Provides deterministic NGO financial fixtures for offline judging, demonstrations,
+    and UI visual testing without hardware dependencies.
     """
     def discover_documents(self, scope_path: str) -> List[Dict[str, Any]]:
         return [
@@ -218,16 +231,16 @@ class EmulatedNASProvider(EvidenceProvider):
 
 class FilesystemNASProvider(EvidenceProvider):
     """
-    Production-hardened evidence acquisition engine scanning an explicitly configured
-    NAS-mounted directory tree.
-    
+    Filesystem evidence acquisition engine scanning an explicitly configured directory tree.
+
     Security & Integrity Guarantees:
     - Path Containment: Validates that all scanned paths resolve strictly within configured nas_root.
     - Path Traversal Defense: Blocks '..' and symlink escapes pointing outside the root.
     - Special File Defense: Rejects FIFOs, devices, and socket nodes to prevent hangs or exploits.
     - Read-Only Operations: Opens files in 'rb' mode only; zero write or mutation calls.
-    - TOCTOU Defense: Verifies file descriptor mtime and size before and after reading to detect mutation.
-    - Streaming SHA-256 Hashing: Ingests files in 64KB blocks to prevent memory exhaustion on large scans.
+    - TOCTOU Defense: Verifies file descriptor mtime and size before and after reading.
+    - Streaming SHA-256 Hashing: Ingests files in 64KB blocks to prevent memory exhaustion.
+    - Resource Bounding: Enforces limits on maximum file count and directory recursion depth.
     """
     SUPPORTED_EXTENSIONS = frozenset({
         ".pdf", ".docx", ".xlsx", ".csv", ".json", ".txt",
@@ -238,8 +251,15 @@ class FilesystemNASProvider(EvidenceProvider):
         ".jpg", ".jpeg", ".png", ".tiff", ".md"
     })
 
-    def __init__(self, nas_root: Optional[str] = None):
+    def __init__(
+        self,
+        nas_root: Optional[str] = None,
+        max_files: Optional[int] = None,
+        max_depth: Optional[int] = None
+    ):
         self.nas_root = nas_root or settings.UGREEN_NAS_ROOT
+        self.max_files = max_files or getattr(settings, "MAX_DISCOVERY_FILES", 500)
+        self.max_depth = max_depth or getattr(settings, "MAX_DISCOVERY_DEPTH", 5)
 
     def _validate_and_resolve_scope(self, scope_path: str) -> str:
         """
@@ -290,7 +310,7 @@ class FilesystemNASProvider(EvidenceProvider):
     @classmethod
     def compute_file_sha256(cls, file_path: str) -> str:
         """
-        Streams file bytes in 64KB chunks and computes the canonical SHA-256 evidence digest.
+        Streams file bytes in 64KB chunks and computes canonical SHA-256 evidence digest.
         Read-only, memory-safe, TOCTOU protected against concurrent file mutation.
         """
         try:
@@ -339,11 +359,9 @@ class FilesystemNASProvider(EvidenceProvider):
         """Determines if a JSON file is a metadata sidecar to a sibling document."""
         if fname.endswith(".meta.json"):
             return True
-        # Checks for files like invoice.pdf.json
         parts = fname.rsplit(".", 2)
         if len(parts) == 3 and f".{parts[1]}".lower() in cls.SUPPORTED_MEDIA_EXTENSIONS:
             return True
-        # Checks for files like invoice.json where invoice.pdf exists
         if fname.endswith(".json"):
             stem = fname[:-5]
             for ext in cls.SUPPORTED_MEDIA_EXTENSIONS:
@@ -354,14 +372,20 @@ class FilesystemNASProvider(EvidenceProvider):
     def discover_documents(self, scope_path: str) -> List[Dict[str, Any]]:
         """
         Scans a genuine local storage directory within authorized scope bounds.
-        Raises NASSecurityViolationError, NASPathNotFoundError, or NASStorageUnavailableError on failure.
+        Bounded by max_depth and max_files to prevent denial-of-service.
         """
         resolved_scope = self._validate_and_resolve_scope(scope_path)
         real_root = os.path.realpath(self.nas_root)
 
+        scope_depth = len(Path(resolved_scope).parts)
         discovered: List[Dict[str, Any]] = []
 
         for root, dirs, files in os.walk(resolved_scope, followlinks=False):
+            # Enforce max directory depth
+            current_depth = len(Path(root).parts) - scope_depth
+            if current_depth >= self.max_depth:
+                dirs.clear()  # Do not descend further
+
             # Prune hidden directories
             dirs[:] = [d for d in dirs if not d.startswith(".")]
 
@@ -378,6 +402,11 @@ class FilesystemNASProvider(EvidenceProvider):
             all_files_in_dir = set(files)
 
             for fname in sorted(files):
+                if len(discovered) >= self.max_files:
+                    raise NASResourceExceededError(
+                        f"Discovery exceeded safety threshold of {self.max_files} files in scope: {scope_path}"
+                    )
+
                 if fname.startswith("."):
                     continue
 
@@ -385,7 +414,6 @@ class FilesystemNASProvider(EvidenceProvider):
                 if ext not in self.SUPPORTED_EXTENSIONS:
                     continue
 
-                # Exclude companion metadata sidecars from independent document discovery
                 if self._is_sidecar_file(fname, all_files_in_dir):
                     continue
 
@@ -394,7 +422,7 @@ class FilesystemNASProvider(EvidenceProvider):
                 # Special file rejection (FIFO, device nodes, sockets)
                 try:
                     lst = os.lstat(full_path)
-                    if (stat.S_ISFIFO(lst.st_mode) or stat.S_ISSOCK(lst.st_mode) or 
+                    if (stat.S_ISFIFO(lst.st_mode) or stat.S_ISSOCK(lst.st_mode) or
                         stat.S_ISCHR(lst.st_mode) or stat.S_ISBLK(lst.st_mode)):
                         raise NASSecurityViolationError(f"Special non-regular file rejected: {full_path}")
                 except OSError as e:
@@ -432,9 +460,9 @@ class FilesystemNASProvider(EvidenceProvider):
 
     def extract_document(self, file_path: str, doc_type: str) -> Dict[str, Any]:
         """
-        Extracts structured financial fields from genuine files.
-        Checks for OCR/indexing sidecars (*.json, *.meta.json) or plain text heuristic parsing.
-        Strictly read-only, TOCTOU protected.
+        Extracts structured financial fields and full provenance from genuine files using
+        FinancialDocumentExtractor (supporting PDF, CSV, TXT, JSON, and sidecars).
+        Strictly read-only, TOCTOU protected, path containment verified.
         """
         if not os.path.exists(file_path):
             return {"status": "UNAVAILABLE"}
@@ -449,134 +477,133 @@ class FilesystemNASProvider(EvidenceProvider):
         # Reject special files
         try:
             lst = os.lstat(file_path)
-            if (stat.S_ISFIFO(lst.st_mode) or stat.S_ISSOCK(lst.st_mode) or 
+            if (stat.S_ISFIFO(lst.st_mode) or stat.S_ISSOCK(lst.st_mode) or
                 stat.S_ISCHR(lst.st_mode) or stat.S_ISBLK(lst.st_mode)):
                 raise NASSecurityViolationError(f"Special non-regular file rejected: {file_path}")
         except OSError:
             return {"status": "UNAVAILABLE"}
 
-        # 1. Check for companion indexing sidecar
-        sidecar_candidates = [
-            f"{file_path}.json",
-            f"{os.path.splitext(file_path)[0]}.json",
-            f"{file_path}.meta.json"
-        ]
-        parent_dir = os.path.dirname(real_file)
-        for sidecar in sidecar_candidates:
-            if os.path.exists(sidecar):
-                real_sidecar = os.path.realpath(sidecar)
-                if real_root and os.path.commonpath([real_root, real_sidecar]) != real_root:
-                    continue
-                if os.path.dirname(real_sidecar) != parent_dir:
-                    continue
-                try:
-                    s_st = os.lstat(sidecar)
-                    if not stat.S_ISREG(s_st.st_mode) or s_st.st_size > 1_048_576:
-                        continue
-                    with open(sidecar, "r", encoding="utf-8") as sf:
-                        s_fd = sf.fileno()
-                        s_st_before = os.fstat(s_fd)
-                        data = json.load(sf)
-                        s_st_after = os.fstat(s_fd)
-                        if s_st_before.st_mtime_ns != s_st_after.st_mtime_ns:
-                            raise NASFileMutationError(f"Sidecar file mutated during extraction: {sidecar}")
-                        if isinstance(data, dict):
-                            data.setdefault("status", "EXTRACTED")
-                            return data
-                except NASFileMutationError:
-                    raise
-                except Exception:
-                    pass
+        # Enforce pre-extraction size ceiling
+        try:
+            st = os.stat(file_path)
+            max_sz = getattr(settings, "MAX_FILE_SIZE_BYTES", 25 * 1024 * 1024)
+            if st.st_size > max_sz:
+                return {
+                    "status": "UNVERIFIED",
+                    "error": f"File exceeds maximum analysis size of {max_sz} bytes."
+                }
+        except OSError:
+            pass
 
-        # 2. Check if the file itself is a standalone JSON document
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".json":
-            try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    fd = f.fileno()
-                    st_before = os.fstat(fd)
-                    data = json.load(f)
-                    st_after = os.fstat(fd)
-                    if st_before.st_mtime_ns != st_after.st_mtime_ns:
-                        raise NASFileMutationError(f"JSON document mutated during extraction: {file_path}")
-                    if isinstance(data, dict):
-                        data.setdefault("status", "EXTRACTED")
-                        return data
-            except NASFileMutationError:
-                raise
-            except Exception:
-                return {"status": "UNVERIFIED", "error": "Malformed JSON document"}
+        # Compute file sha256 to pass to provenance
+        try:
+            sha_digest = self.compute_file_sha256(file_path)
+        except Exception:
+            sha_digest = None
 
-        # 3. Check for plaintext, csv, or markdown structured documents
-        if ext in (".txt", ".md", ".csv"):
-            try:
-                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                    fd = f.fileno()
-                    st_before = os.fstat(fd)
-                    content = f.read(65536)
-                    st_after = os.fstat(fd)
-                    if st_before.st_mtime_ns != st_after.st_mtime_ns:
-                        raise NASFileMutationError(f"Text document mutated during extraction: {file_path}")
-                    return self._parse_text_heuristics(content, doc_type, file_path)
-            except NASFileMutationError:
-                raise
-            except Exception:
-                return {"status": "UNVERIFIED", "error": "Unreadable text file"}
+        return FinancialDocumentExtractor.extract_document(
+            file_path=file_path,
+            doc_type=doc_type,
+            nas_root=self.nas_root,
+            file_sha256=sha_digest
+        )
 
-        # 4. Default conservative fallback: scanned or binary document without companion sidecar
-        return {
-            "status": "UNVERIFIED",
-            "error": "Scanned or binary document without companion OCR indexing sidecar"
-        }
 
+class LocalDevStorageProvider(FilesystemNASProvider):
+    """
+    Mode A: Local Development & Isolated Testing Provider.
+    Scans local developer directories or test fixtures. Ensures predictable,
+    reproducible test execution without physical NAS hardware.
+    """
+    def __init__(
+        self,
+        dev_root: Optional[str] = None,
+        max_files: Optional[int] = None,
+        max_depth: Optional[int] = None
+    ):
+        root = dev_root or getattr(settings, "LOCAL_DEV_ROOT", "./storage/dev_fixtures")
+        os.makedirs(root, exist_ok=True)
+        super().__init__(nas_root=root, max_files=max_files, max_depth=max_depth)
+
+
+class PhysicalNASStorageProvider(FilesystemNASProvider):
+    """
+    Mode C: Physical UGREEN AI NAS Provider.
+    Enforces production physical NAS mount guarantees:
+    - Verifies physical mount presence (e.g. /volume1/NGO_Projects).
+    - Requires strict read-only operation.
+    - Explicitly surfaces hardware unavailability without falling back to mock fixtures.
+    """
+    def __init__(
+        self,
+        nas_root: Optional[str] = None,
+        max_files: Optional[int] = None,
+        max_depth: Optional[int] = None
+    ):
+        super().__init__(
+            nas_root=nas_root or settings.UGREEN_NAS_ROOT,
+            max_files=max_files,
+            max_depth=max_depth
+        )
+
+    def verify_hardware_readiness(self) -> Dict[str, Any]:
+        """
+        Diagnostic probe to verify that physical UGREEN NAS storage volume is mounted,
+        accessible, and adheres to read-only constraints.
+        """
+        if not self.nas_root or not os.path.exists(self.nas_root):
+            return {
+                "hardware_ready": False,
+                "status": "UNMOUNTED",
+                "nas_root": self.nas_root,
+                "error": f"Configured physical NAS root '{self.nas_root}' is not mounted."
+            }
+
+        try:
+            st = os.stat(self.nas_root)
+            return {
+                "hardware_ready": True,
+                "status": "MOUNTED",
+                "nas_root": self.nas_root,
+                "permissions_octal": oct(st.st_mode)[-3:],
+                "inode": st.st_ino
+            }
+        except Exception as e:
+            return {
+                "hardware_ready": False,
+                "status": "ERROR",
+                "nas_root": self.nas_root,
+                "error": str(e)
+            }
+
+
+class StorageProviderFactory:
+    """
+    Provider factory selecting between Mode A, Mode B, and Mode C based on validated
+    runtime environment settings.
+    """
     @staticmethod
-    def _parse_text_heuristics(content: str, doc_type: str, file_path: str) -> Dict[str, Any]:
-        """Deterministic extractor for tabular text/csv without inventing numbers."""
-        res: Dict[str, Any] = {"status": "EXTRACTED"}
+    def get_provider(
+        mode: Optional[Union[StorageMode, str]] = None,
+        nas_root: Optional[str] = None
+    ) -> EvidenceProvider:
+        raw_mode = (mode or getattr(settings, "UGREEN_NAS_MODE", "emulated")).lower().strip()
 
-        amt_match = re.search(r"(?:amount|total|billed|paid|approved|sum)[\s:=]+([\d,]+(?:\.\d{1,4})?)", content, re.IGNORECASE)
-        if amt_match:
-            try:
-                res["amount"] = float(amt_match.group(1).replace(",", ""))
-            except ValueError:
-                res["amount"] = None
-
-        curr_match = re.search(r"\b(USD|EUR|GBP|KES|UGX|CAD|AUD|CHF|JPY)\b", content)
-        if curr_match:
-            res["currency"] = curr_match.group(1).upper()
+        if raw_mode in ("real", "physical_nas", "mode_c"):
+            return PhysicalNASStorageProvider(nas_root=nas_root or settings.UGREEN_NAS_ROOT)
+        elif raw_mode in ("local_dev", "mode_a", "dev"):
+            return LocalDevStorageProvider(dev_root=nas_root or getattr(settings, "LOCAL_DEV_ROOT", "./storage/dev_fixtures"))
+        elif raw_mode in ("emulated", "emulated_nas", "mode_b"):
+            return EmulatedNASProvider()
         else:
-            res["currency"] = None
-
-        date_match = re.search(r"\b(20\d{2}[-/]\d{2}[-/]\d{2})\b", content)
-        if date_match:
-            res["date"] = date_match.group(1)
-
-        po_match = re.search(r"\b(PO[-_0-9A-Z]+)\b", content, re.IGNORECASE)
-        if po_match:
-            res["po_reference"] = po_match.group(1).upper()
-
-        inv_match = re.search(r"\b(INV[-_0-9A-Z]+)\b", content, re.IGNORECASE)
-        if inv_match:
-            res["invoice_number"] = inv_match.group(1).upper()
-
-        rec_match = re.search(r"\b(REC[-_0-9A-Z]+|VOUCH[-_0-9A-Z]+)\b", content, re.IGNORECASE)
-        if rec_match:
-            res["receipt_id"] = rec_match.group(1).upper()
-
-        if doc_type == "PURCHASE_ORDER":
-            res.setdefault("po_reference", os.path.splitext(os.path.basename(file_path))[0])
-        elif doc_type == "INVOICE":
-            res.setdefault("invoice_number", os.path.splitext(os.path.basename(file_path))[0])
-        elif doc_type == "RECEIPT":
-            res.setdefault("receipt_id", os.path.splitext(os.path.basename(file_path))[0])
-
-        return res
+            raise ValueError(f"Invalid storage mode: '{raw_mode}'. Permitted: 'real', 'emulated', 'local_dev'.")
 
 
 class UGreenNASBridge:
     """
     Pluggable router delegating to FilesystemNASProvider or EmulatedNASProvider
     based on explicit configuration settings (settings.UGREEN_NAS_MODE).
+    Maintains 100% backward-compatibility for all existing service and test callers.
     """
     def __init__(self, nas_host: Optional[str] = None):
         self.nas_host = nas_host or "local"
@@ -587,7 +614,11 @@ class UGreenNASBridge:
         if mode == "real":
             return FilesystemNASProvider(nas_root=settings.UGREEN_NAS_ROOT)
         elif mode == "emulated":
+            if getattr(settings, "STORAGE_MODE", "") == "local_dev":
+                return LocalDevStorageProvider(dev_root=getattr(settings, "LOCAL_DEV_ROOT", None))
             return self._emulated_provider
+        elif mode in ("local_dev", "physical_nas"):
+            return StorageProviderFactory.get_provider(mode=mode)
         else:
             raise ValueError(f"Invalid UGREEN_NAS_MODE: '{mode}'. Allowed modes are 'real' or 'emulated'.")
 

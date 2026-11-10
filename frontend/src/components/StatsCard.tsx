@@ -7,7 +7,7 @@ interface StatsCardProps {
   subtitle?: string;
   icon: LucideIcon;
   badge?: string;
-  badgeColor?: 'emerald' | 'amber' | 'rose' | 'sky' | 'indigo';
+  badgeColor?: 'emerald' | 'amber' | 'rose' | 'sky' | 'indigo' | 'purple';
 }
 
 export const StatsCard: React.FC<StatsCardProps> = ({
@@ -19,33 +19,42 @@ export const StatsCard: React.FC<StatsCardProps> = ({
   badgeColor = 'sky'
 }) => {
   const badgeClasses = {
-    emerald: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-    amber: 'bg-amber-50 text-amber-700 border-amber-200',
-    rose: 'bg-rose-50 text-rose-700 border-rose-200',
-    sky: 'bg-sky-50 text-sky-700 border-sky-200',
-    indigo: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+    emerald: 'bg-emerald-50 text-emerald-700 border-emerald-200/80',
+    amber: 'bg-amber-50 text-amber-700 border-amber-200/80',
+    rose: 'bg-rose-50 text-rose-700 border-rose-200/80',
+    sky: 'bg-sky-50 text-sky-700 border-sky-200/80',
+    indigo: 'bg-indigo-50 text-indigo-700 border-indigo-200/80',
+    purple: 'bg-purple-50 text-purple-700 border-purple-200/80',
   };
 
   return (
-    <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm hover:shadow transition-shadow">
-      <div className="flex items-center justify-between">
-        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">{title}</span>
-        <div className="p-2.5 rounded-xl bg-slate-50 border border-slate-100 text-slate-600">
-          <Icon className="w-5 h-5 text-slate-700" />
+    <div className="bg-white rounded-2xl border border-slate-200/90 p-4 sm:p-5 shadow-xs hover:shadow-md transition-all flex flex-col justify-between">
+      <div>
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider truncate">
+            {title}
+          </span>
+          <div className="p-2 rounded-xl bg-slate-50 border border-slate-100 text-slate-600 shrink-0">
+            <Icon className="w-4 h-4 sm:w-5 sm:h-5 text-slate-700" />
+          </div>
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-baseline gap-2">
+          <span className="text-xl sm:text-2xl lg:text-3xl font-bold text-slate-900 tracking-tight break-all">
+            {value}
+          </span>
+          {badge && (
+            <span className={`text-[10px] sm:text-[11px] font-semibold px-2 py-0.5 rounded-full border shrink-0 ${badgeClasses[badgeColor]}`}>
+              {badge}
+            </span>
+          )}
         </div>
       </div>
 
-      <div className="mt-3 flex items-baseline space-x-2">
-        <span className="text-2xl font-bold text-slate-900 tracking-tight">{value}</span>
-        {badge && (
-          <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${badgeClasses[badgeColor]}`}>
-            {badge}
-          </span>
-        )}
-      </div>
-
       {subtitle && (
-        <p className="mt-1.5 text-xs text-slate-500">{subtitle}</p>
+        <p className="mt-2 text-xs text-slate-500 leading-snug">
+          {subtitle}
+        </p>
       )}
     </div>
   );

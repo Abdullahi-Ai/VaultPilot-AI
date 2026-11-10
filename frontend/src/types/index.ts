@@ -1,4 +1,4 @@
-export type FindingClassification = 
+export type FindingClassification =
   | 'CONFIRMED_DISCREPANCY'
   | 'POTENTIAL_ANOMALY'
   | 'MISSING_EVIDENCE'
@@ -72,7 +72,7 @@ export interface EvidenceLedgerEntry {
   transaction_id?: string;
   item_description: string;
   supplier_name?: string;
-  
+
   po_reference?: string;
   po_amount?: number;
   invoice_number?: string;
@@ -81,21 +81,21 @@ export interface EvidenceLedgerEntry {
   receipt_amount?: number;
   paid_amount?: number;
   approved_variation_amount?: number;
-  
+
   variance_amount?: number;
   variance_reason?: string;
   currency?: string | null;
   reconciliation_status: ReconciliationStatus;
-  
+
   match_confidence?: 'EXACT_MATCH' | 'PROBABLE_MATCH' | 'PARTIAL_MATCH' | 'UNMATCHED' | 'CONFLICTING_EVIDENCE';
   requires_human_review?: boolean;
   human_review_reason?: string;
-  
-  multiple_invoices_breakdown?: Array<{ invoice_number?: string; amount?: number; currency?: string; doc_id?: number }>;
+
+  multiple_invoices_breakdown?: Array<{ invoice_number?: string; amount?: number; currency?: string; doc_id?: number; original_amount?: number; is_human_corrected?: boolean }>;
   multiple_receipts_breakdown?: Array<{ receipt_id?: string; amount?: number; currency?: string; doc_id?: number }>;
   project_report_reference?: string;
   report_reconciled?: boolean;
-  
+
   source_file_paths: string[];
   created_at: string;
 
@@ -160,4 +160,62 @@ export interface DashboardStats {
     MISSING_PO: number;
     UNVERIFIED: number;
   };
+}
+
+// Phase 3.3 Evidence Review & Human Verification
+export type ReviewStatus =
+  | 'PENDING'
+  | 'VERIFIED'
+  | 'CORRECTED'
+  | 'REJECTED'
+  | 'REQUIRES_CLARIFICATION';
+
+export interface FieldReview {
+  id: number;
+  document_id: number;
+  field_name: string;
+  original_value: any;
+  reviewed_value: any;
+  status: ReviewStatus;
+  reviewer_id?: string | null;
+  review_timestamp?: string | null;
+  reviewer_notes?: string | null;
+  source_provenance?: Record<string, any> | null;
+  extraction_method?: string | null;
+  original_document_sha256?: string | null;
+  extraction_version?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FieldReviewAuditLog {
+  id: number;
+  field_review_id: number;
+  document_id: number;
+  field_name: string;
+  action: string;
+  previous_status?: string | null;
+  new_status: string;
+  previous_value?: any;
+  new_value?: any;
+  reviewer_id?: string | null;
+  notes?: string | null;
+  action_timestamp: string;
+  document_sha256?: string | null;
+}
+
+export interface DocumentReviewSummary {
+  document_id: number;
+  filename: string;
+  document_type: string;
+  extraction_status: string;
+  sha256?: string | null;
+  total_fields: number;
+  pending_count: number;
+  verified_count: number;
+  corrected_count: number;
+  rejected_count: number;
+  clarification_count: number;
+  is_fully_reviewed: boolean;
+  fields: FieldReview[];
 }

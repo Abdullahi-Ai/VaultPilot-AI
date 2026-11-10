@@ -104,3 +104,19 @@ def get_investigation(investigation_id: int, db: Session = Depends(get_db)):
     if not investigation:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Investigation not found.")
     return investigation
+
+@router.post("/{investigation_id}/reconcile", response_model=InvestigationOut)
+def reconcile_investigation(investigation_id: int, db: Session = Depends(get_db)):
+    """
+    Re-evaluates reconciliation for an existing investigation incorporating
+    current human verification and correction decisions.
+    """
+    try:
+        return InvestigationService.reconcile_investigation(db=db, investigation_id=investigation_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Reconciliation re-evaluation failed: {str(e)}"
+        )

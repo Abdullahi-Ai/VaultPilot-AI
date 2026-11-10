@@ -42,12 +42,16 @@ def init_db_and_seed():
             db.commit()
             db.refresh(demo_project_2)
 
-            # Auto-run baseline demo investigation
-            InvestigationService.run_investigation(
-                db=db,
-                project_id=demo_project.id,
-                title="Baseline Financial Evidence Audit"
-            )
+            # Auto-run baseline demo investigation if storage is reachable
+            try:
+                InvestigationService.run_investigation(
+                    db=db,
+                    project_id=demo_project.id,
+                    title="Baseline Financial Evidence Audit"
+                )
+            except Exception as e:
+                # In physical NAS mode, storage volume may not yet be mounted at initial startup
+                pass
     finally:
         db.close()
 

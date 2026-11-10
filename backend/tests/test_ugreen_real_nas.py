@@ -1,6 +1,8 @@
 import os
+import stat
 import json
 import pytest
+from app.core.config import settings, Settings
 from app.models.project import Project
 from app.models.investigation import Investigation
 from app.services.ugreen_bridge import (
@@ -8,7 +10,11 @@ from app.services.ugreen_bridge import (
     FilesystemNASProvider,
     EmulatedNASProvider,
     NASSecurityViolationError,
-    NASPathUnreachableError
+    NASInvalidPathError,
+    NASPathUnreachableError,
+    NASStorageUnavailableError,
+    NASPathNotFoundError,
+    NASFileMutationError
 )
 from app.services.investigation_service import InvestigationService
 
@@ -146,8 +152,11 @@ def test_read_only_integrity_source_files_remain_unmodified(tmp_path):
     # Verify file content and mtime unchanged
     assert sample_file.read_text() == original_text
 
-def test_investigation_service_runs_real_filesystem_audit(test_db, tmp_path):
-    """End-to-end integration test: InvestigationService discovers real files and reconciles correctly."""
+def test_investigation_service_runs_real_filesystem_audit(test_db, tmp_path, monkeypatch):
+    """End-to-end integration test: InvestigationService discovers real files and reconciles correctly in real mode."""
+    monkeypatch.setattr(settings, "UGREEN_NAS_MODE", "real")
+    monkeypatch.setattr(settings, "UGREEN_NAS_ROOT", str(tmp_path))
+
     project = Project(
         name="Real NAS Test Project",
         code="PRJ-REAL-2026",
@@ -180,8 +189,11 @@ def test_investigation_service_runs_real_filesystem_audit(test_db, tmp_path):
     assert "USD" in inv.verified_totals
     assert inv.verified_totals["USD"] == 3200.00
 
-def test_investigation_service_empty_real_folder(test_db, tmp_path):
-    """Verify empty directory yields completed audit with 0 files cleanly."""
+def test_investigation_service_empty_real_folder(test_db, tmp_path, monkeypatch):
+    """Verify empty directory yields completed audit with 0 files cleanly in real mode."""
+    monkeypatch.setattr(settings, "UGREEN_NAS_MODE", "real")
+    monkeypatch.setattr(settings, "UGREEN_NAS_ROOT", str(tmp_path))
+
     empty_dir = tmp_path / "empty_folder"
     empty_dir.mkdir()
 
@@ -205,3 +217,162 @@ def test_investigation_service_empty_real_folder(test_db, tmp_path):
     assert inv.status == "COMPLETED"
     assert inv.document_count == 0
     assert "No financial documents discovered" in inv.summary
+
+def test_configuration_mode_standardization():
+    """Verify UGREEN_NAS_MODE strictly enforces 'real' and 'emulated', rejecting 'mock' or arbitrary strings."""
+    # Valid configurations
+    s_real = Settings(UGREEN_NAS_MODE="real")
+    assert s_real.UGREEN_NAS_MODE == "real"
+
+    s_emulated = Settings(UGREEN_NAS_MODE="emulated")
+    assert s_emulated.UGREEN_NAS_MODE == "emulated"
+
+    # 'mock' and invalid modes must be rejected
+    with pytest.raises(ValueError) as exc_mock:
+        Settings(UGREEN_NAS_MODE="mock")
+    assert "Must be 'real' or 'emulated'" in str(exc_mock.value)
+
+    with pytest.raises(ValueError) as exc_invalid:
+        Settings(UGREEN_NAS_MODE="arbitrary_mode")
+    assert "Must be 'real' or 'emulated'" in str(exc_invalid.value)
+
+def test_no_silent_fallback_in_real_mode(tmp_path, monkeypatch):
+    """Verify that when UGREEN_NAS_MODE='real', missing files or paths fail explicitly without mock data."""
+    monkeypatch.setattr(settings, "UGREEN_NAS_MODE", "real")
+    monkeypatch.setattr(settings, "UGREEN_NAS_ROOT", str(tmp_path))
+
+    nonexistent_dir = str(tmp_path / "offline_subfolder")
+    with pytest.raises(NASPathNotFoundError):
+        ugreen_bridge.discover_documents(nonexistent_dir)
+
+    # Missing file extraction in real mode returns UNAVAILABLE, never fixture data
+    res = ugreen_bridge.extract_document(str(tmp_path / "missing_po.pdf"), "PURCHASE_ORDER")
+    assert res == {"status": "UNAVAILABLE"}
+
+def test_special_file_fifo_rejection(tmp_path):
+    """Verify that special files like FIFOs (named pipes) are rejected to prevent hangs and security exploits."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("mkfifo not supported on this platform")
+
+    fifo_path = tmp_path / "evil_pipe.txt"
+    try:
+        os.mkfifo(str(fifo_path))
+    except (OSError, PermissionError):
+        pytest.skip("Permission denied creating FIFO")
+
+    provider = FilesystemNASProvider(nas_root=str(tmp_path))
+
+    with pytest.raises(NASSecurityViolationError) as exc_info:
+        provider.discover_documents(str(tmp_path))
+
+    assert "Special non-regular file rejected" in str(exc_info.value)
+
+def test_companion_sidecar_deduplication_and_association(tmp_path):
+    """Verify sidecar JSON files are safely associated with their primary document and not double-counted."""
+    orders_dir = tmp_path / "orders"
+    orders_dir.mkdir()
+
+    pdf_file = orders_dir / "PO-8888.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4 Real Binary Purchase Order")
+
+    sidecar_file = orders_dir / "PO-8888.json"
+    sidecar_file.write_text(json.dumps({
+        "vendor": "SolarTech Global",
+        "po_reference": "PO-8888",
+        "amount": 19500.0,
+        "currency": "USD",
+        "status": "EXTRACTED"
+    }))
+
+    provider = FilesystemNASProvider(nas_root=str(tmp_path))
+    docs = provider.discover_documents(str(tmp_path))
+
+    # Sidecar PO-8888.json must NOT appear as a distinct document
+    assert len(docs) == 1
+    assert docs[0]["filename"] == "PO-8888.pdf"
+
+    # Extracting PO-8888.pdf must correctly read the companion sidecar data
+    extracted = provider.extract_document(str(pdf_file), "PURCHASE_ORDER")
+    assert extracted["status"] == "EXTRACTED"
+    assert extracted["vendor"] == "SolarTech Global"
+    assert extracted["amount"] == 19500.0
+    assert extracted["currency"] == "USD"
+
+def test_toctou_file_mutation_detection(tmp_path, monkeypatch):
+    """Verify concurrent modification during hashing is caught by TOCTOU checks."""
+    test_file = tmp_path / "mutating_doc.bin"
+    test_file.write_bytes(b"initial data")
+
+    # Simulate concurrent mutation by patching os.fstat on the second call
+    original_fstat = os.fstat
+    call_count = [0]
+
+    def mock_fstat(fd):
+        st = original_fstat(fd)
+        call_count[0] += 1
+        if call_count[0] > 1:
+            # Return an altered mtime_ns on the second check
+            class MutatedStat:
+                st_mode = st.st_mode
+                st_size = st.st_size
+                st_mtime_ns = st.st_mtime_ns + 1000000000
+            return MutatedStat()
+        return st
+
+    monkeypatch.setattr(os, "fstat", mock_fstat)
+
+    with pytest.raises(NASFileMutationError) as exc_info:
+        FilesystemNASProvider.compute_file_sha256(str(test_file))
+
+    assert "concurrently mutated" in str(exc_info.value)
+
+def test_api_distinguishes_invalid_path_from_unavailable_storage(client, test_db, tmp_path, monkeypatch):
+    """Verify API endpoint returns 400 for path security violation, 404 for missing folder, and 503 for offline NAS."""
+    project = Project(
+        name="API Error Test Project",
+        code="PRJ-ERR-2026",
+        budget=1000.0,
+        currency="USD",
+        nas_folder_path=str(tmp_path)
+    )
+    test_db.add(project)
+    test_db.commit()
+
+    monkeypatch.setattr(settings, "UGREEN_NAS_MODE", "real")
+    monkeypatch.setattr(settings, "UGREEN_NAS_ROOT", str(tmp_path))
+
+    # 1. Root boundary escape security violation (no '..' characters, passes schema, rejected by provider) -> 400 Bad Request
+    res_escape = client.post("/api/v1/investigations/run", json={
+        "project_id": project.id,
+        "folder_path": "/etc",
+        "title": "Root Escape Test"
+    })
+    assert res_escape.status_code == 400
+    assert "security violation" in res_escape.json()["detail"].lower()
+
+    # 2. Directory traversal sequence -> 400 or 422
+    res_traversal = client.post("/api/v1/investigations/run", json={
+        "project_id": project.id,
+        "folder_path": str(tmp_path / ".." / "etc"),
+        "title": "Traversal Test"
+    })
+    assert res_traversal.status_code in (400, 422)
+
+    # 2. Target folder does not exist -> 404 Not Found
+    res_missing = client.post("/api/v1/investigations/run", json={
+        "project_id": project.id,
+        "folder_path": str(tmp_path / "nonexistent_subfolder"),
+        "title": "Missing Subfolder Test"
+    })
+    assert res_missing.status_code == 404
+    assert "not found" in res_missing.json()["detail"].lower()
+
+    # 3. NAS storage root is offline or unmounted -> 503 Service Unavailable
+    monkeypatch.setattr(settings, "UGREEN_NAS_ROOT", "/tmp/completely_unmounted_volume_root_xyz")
+    res_offline = client.post("/api/v1/investigations/run", json={
+        "project_id": project.id,
+        "folder_path": "/tmp/completely_unmounted_volume_root_xyz/share",
+        "title": "Offline NAS Test"
+    })
+    assert res_offline.status_code == 503
+    assert "unavailable" in res_offline.json()["detail"].lower()

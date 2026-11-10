@@ -1,4 +1,4 @@
-import { Project, Investigation, Finding, EvidenceLedgerEntry, DashboardStats, DataSourceState, DocumentRecord, InvestigationReportSummary } from '../types';
+import { Project, Investigation, Finding, EvidenceLedgerEntry, DashboardStats, DataSourceState, DocumentRecord, InvestigationReportSummary, FieldReview, FieldReviewAuditLog, DocumentReviewSummary } from '../types';
 
 const API_BASE = '/api/v1';
 
@@ -665,5 +665,151 @@ export const apiService = {
 
   getReportMarkdownUrl(investigationId: number, reportId: number): string {
     return `${API_BASE}/investigations/${investigationId}/reports/${reportId}/markdown`;
+  },
+
+  // ==========================================
+  // Phase 3.3 Evidence Review & Human Verification
+  // ==========================================
+
+  async getPendingReviews(params?: { projectId?: number; investigationId?: number; status?: string }): Promise<FieldReview[]> {
+    const query = new URLSearchParams();
+    if (params?.projectId) query.append('project_id', params.projectId.toString());
+    if (params?.investigationId) query.append('investigation_id', params.investigationId.toString());
+    if (params?.status) query.append('status', params.status);
+
+    const res = await fetch(`${API_BASE}/reviews/pending?${query.toString()}`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch pending reviews: ${res.statusText}`);
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async getDocumentReviewSummary(documentId: number): Promise<DocumentReviewSummary> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: `Failed to fetch document ${documentId} review summary` }));
+      throw new Error(err.detail || `Failed to fetch document ${documentId} review summary`);
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async initializeDocumentReviews(documentId: number): Promise<FieldReview[]> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/initialize`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to initialize reviews' }));
+      throw new Error(err.detail || 'Failed to initialize reviews');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async getDocumentReviewHistory(documentId: number): Promise<FieldReviewAuditLog[]> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/history`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to fetch review history' }));
+      throw new Error(err.detail || 'Failed to fetch review history');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async getFieldReview(documentId: number, fieldName: string): Promise<FieldReview> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/${encodeURIComponent(fieldName)}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: `Field '${fieldName}' not found` }));
+      throw new Error(err.detail || `Field '${fieldName}' not found`);
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async verifyField(documentId: number, fieldName: string, notes?: string, reviewerId?: string): Promise<FieldReview> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/${encodeURIComponent(fieldName)}/verify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ notes, reviewer_id: reviewerId })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to verify field' }));
+      throw new Error(err.detail || 'Failed to verify field');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async correctField(documentId: number, fieldName: string, correctedValue: any, notes?: string, reviewerId?: string): Promise<FieldReview> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/${encodeURIComponent(fieldName)}/correct`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ corrected_value: correctedValue, notes, reviewer_id: reviewerId })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to correct field' }));
+      throw new Error(err.detail || 'Failed to correct field');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async rejectField(documentId: number, fieldName: string, reason: string, reviewerId?: string): Promise<FieldReview> {
+    if (!reason || !reason.trim()) {
+      throw new Error('Rejection requires a mandatory audit reason.');
+    }
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/${encodeURIComponent(fieldName)}/reject`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reason: reason.trim(), reviewer_id: reviewerId })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to reject field' }));
+      throw new Error(err.detail || 'Failed to reject field');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async clarifyField(documentId: number, fieldName: string, question: string, reviewerId?: string): Promise<FieldReview> {
+    if (!question || !question.trim()) {
+      throw new Error('Clarification request requires a mandatory inquiry question.');
+    }
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reviews/${encodeURIComponent(fieldName)}/clarify`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ clarification_question: question.trim(), reviewer_id: reviewerId })
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to request clarification' }));
+      throw new Error(err.detail || 'Failed to request clarification');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async reconcileInvestigation(investigationId: number): Promise<Investigation> {
+    const res = await fetch(`${API_BASE}/investigations/${investigationId}/reconcile`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to re-evaluate reconciliation' }));
+      throw new Error(err.detail || 'Failed to re-evaluate reconciliation');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
+  },
+
+  async reconcileDocument(documentId: number): Promise<{ status: string; investigation_id: number; document_id: number; verified_totals: Record<string, number>; summary: string }> {
+    const res = await fetch(`${API_BASE}/documents/${documentId}/reconcile`, {
+      method: 'POST'
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: 'Failed to re-evaluate reconciliation for document' }));
+      throw new Error(err.detail || 'Failed to re-evaluate reconciliation for document');
+    }
+    updateState('LIVE_BACKEND');
+    return await res.json();
   }
 };

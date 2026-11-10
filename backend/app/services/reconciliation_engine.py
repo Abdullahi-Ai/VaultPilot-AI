@@ -23,6 +23,18 @@ def normalize_currency(curr: Any) -> Optional[str]:
         return cleaned.upper()
     return None
 
+def _safe_float(v: Any) -> Optional[float]:
+    """Safely converts string, decimal, or numeric input to float; returns None on failure."""
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (int, float)):
+            return float(v)
+        cleaned = str(v).replace(",", "").replace("$", "").strip()
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
 class MultiSourceReconciliationEngine:
 
     @staticmethod
@@ -35,7 +47,7 @@ class MultiSourceReconciliationEngine:
         Task 1: Structured Matching Engine.
         Matches records using project association, PO reference, invoice reference,
         supplier identity, currency, transaction amounts, and dates.
-        
+
         Strict rule: Do not match records solely because their amounts happen to be equal.
         Distinguishes: EXACT_MATCH, PROBABLE_MATCH, PARTIAL_MATCH, UNMATCHED, CONFLICTING_EVIDENCE, UNVERIFIED.
         """
@@ -49,11 +61,11 @@ class MultiSourceReconciliationEngine:
             po_vendor = (po_data.get("vendor") or "").lower().strip()
             po_curr_raw = po_data.get("currency")
             po_curr = normalize_currency(po_curr_raw)
-            po_amt = po_data.get("amount")
+            po_amt = _safe_float(po_data.get("amount"))
 
             # Look for invoices referencing this PO
             candidate_invoices = [
-                inv for inv in inv_docs 
+                inv for inv in inv_docs
                 if po_ref and (inv.extracted_data or {}).get("po_reference") == po_ref and inv.id not in used_inv_ids
             ]
 
@@ -76,7 +88,7 @@ class MultiSourceReconciliationEngine:
                 inv_data = inv.extracted_data or {}
                 inv_num = inv_data.get("invoice_number")
                 rec_ref = inv_data.get("receipt_reference")
-                
+
                 # Check receipts citing this invoice number or receipt reference
                 # Critical: Never match on None == None!
                 for rec in rec_docs:
@@ -85,13 +97,13 @@ class MultiSourceReconciliationEngine:
                     rec_data = rec.extracted_data or {}
                     rec_inv_ref = rec_data.get("invoice_reference") or rec_data.get("invoice_number")
                     rec_id = rec_data.get("receipt_id")
-                    
+
                     is_rec_match = False
                     if inv_num and rec_inv_ref and rec_inv_ref == inv_num:
                         is_rec_match = True
                     elif rec_id and rec_ref and rec_id == rec_ref:
                         is_rec_match = True
-                    
+
                     if is_rec_match:
                         matched_receipts.append(rec)
                         used_rec_ids.add(rec.id)
@@ -103,7 +115,7 @@ class MultiSourceReconciliationEngine:
 
             if candidate_invoices:
                 all_explicit = all(bool(po_ref and (inv.extracted_data or {}).get("po_reference") == po_ref) for inv in candidate_invoices)
-                
+
                 inv_currencies = [
                     normalize_currency((inv.extracted_data or {}).get("currency"))
                     for inv in candidate_invoices
@@ -130,7 +142,7 @@ class MultiSourceReconciliationEngine:
                     requires_review = True
                     review_reason = "Invoices matched by vendor identity and order context; lacks explicit PO reference in document header."
                 elif len(candidate_invoices) > 1:
-                    inv_sum = sum(((inv.extracted_data or {}).get("amount") or 0.0) for inv in candidate_invoices)
+                    inv_sum = sum((_safe_float((inv.extracted_data or {}).get("amount")) or 0.0) for inv in candidate_invoices)
                     confidence = "PARTIAL_MATCH" if inv_sum < (po_amt or 0.0) else "EXACT_MATCH"
                 else:
                     confidence = "EXACT_MATCH"
@@ -162,13 +174,13 @@ class MultiSourceReconciliationEngine:
                     rec_data = rec.extracted_data or {}
                     rec_inv_ref = rec_data.get("invoice_reference") or rec_data.get("invoice_number")
                     rec_id = rec_data.get("receipt_id")
-                    
+
                     is_rec_match = False
                     if inv_num and rec_inv_ref and rec_inv_ref == inv_num:
                         is_rec_match = True
                     elif rec_id and rec_ref and rec_id == rec_ref:
                         is_rec_match = True
-                    
+
                     if is_rec_match:
                         matched_recs.append(rec)
                         used_rec_ids.add(rec.id)
@@ -197,12 +209,25 @@ class MultiSourceReconciliationEngine:
 
         return matched_groups
 
-    @staticmethod
+    @classmethod
+    def _get_doc_data(cls, doc: Optional[Document], db: Optional[Any] = None) -> Dict[str, Any]:
+        """Returns the effective document data taking human review decisions into account."""
+        if not doc:
+            return {}
+        try:
+            from app.services.review_service import EvidenceReviewService
+            return EvidenceReviewService.get_effective_document_data(doc, db=db)
+        except Exception:
+            return doc.extracted_data or {}
+
+    @classmethod
     def reconcile_group(
+        cls,
         group: Dict[str, Any],
         investigation_id: int,
         target_scope: str,
-        supporting_variations: Optional[List[Dict[str, Any]]] = None
+        supporting_variations: Optional[List[Dict[str, Any]]] = None,
+        db: Optional[Any] = None
     ) -> Tuple[EvidenceLedgerEntry, Optional[Finding]]:
         """
         Task 2: Three-Way Multi-Source Reconciliation (PO -> Invoices -> Receipts).
@@ -226,78 +251,81 @@ class MultiSourceReconciliationEngine:
         requires_review = group.get("requires_human_review", False)
         review_reason = group.get("human_review_reason")
 
-        po_data = po_doc.extracted_data if po_doc else {}
+        po_data = cls._get_doc_data(po_doc, db=db)
         po_ref = po_data.get("po_reference")
-        po_amt = po_data.get("amount")
+        po_amt = _safe_float(po_data.get("amount"))
         po_curr_raw = po_data.get("currency") if po_doc else None
         po_curr = normalize_currency(po_curr_raw)
         supplier = po_data.get("vendor")
 
         # Multi-invoice calculations
-        valid_billed_amts = [
-            (inv.extracted_data or {}).get("amount")
-            for inv in invoice_docs
-            if (inv.extracted_data or {}).get("amount") is not None
-        ]
-        total_billed = sum(valid_billed_amts) if valid_billed_amts else (0.0 if invoice_docs else None)
-        inv_ref_str = ", ".join((inv.extracted_data or {}).get("invoice_number", "INV-UNKNOWN") for inv in invoice_docs) if invoice_docs else None
-        if not supplier and invoice_docs:
-            supplier = (invoice_docs[0].extracted_data or {}).get("vendor")
+        valid_billed_amts = []
+        inv_currs = []
+        inv_currs_raw = []
+        invoices_breakdown = []
+        for inv in invoice_docs:
+            inv_data = cls._get_doc_data(inv, db=db)
+            amt = _safe_float(inv_data.get("amount"))
+            if amt is not None:
+                valid_billed_amts.append(amt)
+            raw_c = inv_data.get("currency")
+            inv_currs_raw.append(raw_c)
+            inv_currs.append(normalize_currency(raw_c))
 
-        inv_currs = [
-            normalize_currency((inv.extracted_data or {}).get("currency"))
-            for inv in invoice_docs
-        ]
-        inv_currs_raw = [
-            (inv.extracted_data or {}).get("currency")
-            for inv in invoice_docs
-        ]
-
-        # Multi-receipt calculations
-        valid_paid_amts = [
-            (rec.extracted_data or {}).get("amount")
-            for rec in receipt_docs
-            if (rec.extracted_data or {}).get("amount") is not None
-        ]
-        total_paid = sum(valid_paid_amts) if valid_paid_amts else (0.0 if receipt_docs and any((r.extracted_data or {}).get("status") == "EXTRACTED" for r in receipt_docs) else None)
-        rec_ref_str = ", ".join((rec.extracted_data or {}).get("receipt_id", "REC-UNKNOWN") for rec in receipt_docs) if receipt_docs else None
-
-        rec_currs = [
-            normalize_currency((rec.extracted_data or {}).get("currency"))
-            for rec in receipt_docs
-        ]
-        rec_currs_raw = [
-            (rec.extracted_data or {}).get("currency")
-            for rec in receipt_docs
-        ]
-
-        # DEF-04: Credit note check
-        negative_invoices = [inv for inv in invoice_docs if ((inv.extracted_data or {}).get("amount") or 0.0) < 0]
-        has_credit_notes = len(negative_invoices) > 0
-
-        # Build breakdowns for 1:N preserving original extracted currency
-        invoices_breakdown = [
-            {
-                "invoice_number": (inv.extracted_data or {}).get("invoice_number"),
-                "amount": (inv.extracted_data or {}).get("amount"),
-                "currency": (inv.extracted_data or {}).get("currency"),
-                "normalized_currency": normalize_currency((inv.extracted_data or {}).get("currency")),
-                "is_credit_adjustment": ((inv.extracted_data or {}).get("amount") or 0.0) < 0,
+            inv_bd = {
+                "invoice_number": inv_data.get("invoice_number"),
+                "amount": amt,
+                "currency": raw_c,
+                "normalized_currency": normalize_currency(raw_c),
+                "is_credit_adjustment": ((amt or 0.0) < 0),
                 "doc_id": inv.id
             }
-            for inv in invoice_docs
-        ]
+            if "_original_amount" in inv_data:
+                inv_bd["original_amount"] = inv_data["_original_amount"]
+                inv_bd["is_human_corrected"] = True
+            if "_human_review_overlay" in inv_data:
+                inv_bd["review_overlay"] = inv_data["_human_review_overlay"]
+            invoices_breakdown.append(inv_bd)
 
-        receipts_breakdown = [
-            {
-                "receipt_id": (rec.extracted_data or {}).get("receipt_id"),
-                "amount": (rec.extracted_data or {}).get("amount"),
-                "currency": (rec.extracted_data or {}).get("currency"),
-                "normalized_currency": normalize_currency((rec.extracted_data or {}).get("currency")),
+        total_billed = sum(valid_billed_amts) if valid_billed_amts else (0.0 if invoice_docs else None)
+        inv_ref_str = ", ".join((cls._get_doc_data(inv, db=db)).get("invoice_number", "INV-UNKNOWN") for inv in invoice_docs) if invoice_docs else None
+        if not supplier and invoice_docs:
+            supplier = (cls._get_doc_data(invoice_docs[0], db=db)).get("vendor")
+
+        # Multi-receipt calculations
+        valid_paid_amts = []
+        rec_currs = []
+        rec_currs_raw = []
+        receipts_breakdown = []
+        for rec in receipt_docs:
+            rec_data = cls._get_doc_data(rec, db=db)
+            amt = _safe_float(rec_data.get("amount"))
+            if amt is not None:
+                valid_paid_amts.append(amt)
+            raw_c = rec_data.get("currency")
+            rec_currs_raw.append(raw_c)
+            rec_currs.append(normalize_currency(raw_c))
+
+            rec_bd = {
+                "receipt_id": rec_data.get("receipt_id"),
+                "amount": amt,
+                "currency": raw_c,
+                "normalized_currency": normalize_currency(raw_c),
                 "doc_id": rec.id
             }
-            for rec in receipt_docs
-        ]
+            if "_original_amount" in rec_data:
+                rec_bd["original_amount"] = rec_data["_original_amount"]
+                rec_bd["is_human_corrected"] = True
+            if "_human_review_overlay" in rec_data:
+                rec_bd["review_overlay"] = rec_data["_human_review_overlay"]
+            receipts_breakdown.append(rec_bd)
+
+        total_paid = sum(valid_paid_amts) if valid_paid_amts else (0.0 if receipt_docs and any(cls._get_doc_data(r, db=db).get("status") == "EXTRACTED" for r in receipt_docs) else None)
+        rec_ref_str = ", ".join((cls._get_doc_data(rec, db=db)).get("receipt_id", "REC-UNKNOWN") for rec in receipt_docs) if receipt_docs else None
+
+        # DEF-04: Credit note check
+        negative_invoices = [inv for inv in invoice_docs if (_safe_float((cls._get_doc_data(inv, db=db)).get("amount")) or 0.0) < 0]
+        has_credit_notes = len(negative_invoices) > 0
 
         all_doc_ids = []
         if po_doc: all_doc_ids.append(po_doc.id)
@@ -313,6 +341,25 @@ class MultiSourceReconciliationEngine:
         variations = supporting_variations or []
         approved_var_sum = sum(v.get("amount", 0.0) for v in variations)
 
+        # Evidence-specific check: unverified billing documents (PO or Invoice) prevent direct comparison
+        # When human verification has verified or corrected critical fields, the document is no longer blocked as unverified.
+        unverified_billing_doc = next(
+            (d for d in [po_doc] + invoice_docs
+             if d and (
+                 (cls._get_doc_data(d, db=db).get("requires_human_verification") is True or d.extraction_status == "UNVERIFIED")
+                 and not cls._get_doc_data(d, db=db).get("is_human_verified", False)
+             )),
+            None
+        )
+        unverified_receipt_doc = next(
+            (d for d in receipt_docs
+             if d and (
+                 (cls._get_doc_data(d, db=db).get("requires_human_verification") is True or d.extraction_status == "UNVERIFIED")
+                 and not cls._get_doc_data(d, db=db).get("is_human_verified", False)
+             )),
+            None
+        )
+
         # Primary Currency: Do NOT default to USD. Preserve None if missing.
         currency = po_curr if (po_doc and po_curr) else (inv_currs[0] if (inv_currs and inv_currs[0]) else (rec_currs[0] if (rec_currs and rec_currs[0]) else None))
         curr_display = currency or "[UNDOCUMENTED CURRENCY]"
@@ -323,7 +370,7 @@ class MultiSourceReconciliationEngine:
             has_missing_currency = True
         if invoice_docs and any(c is None for c in inv_currs):
             has_missing_currency = True
-        if receipt_docs and any(c is None for c in rec_currs):
+        if receipt_docs and not unverified_receipt_doc and any(c is None for c in rec_currs):
             has_missing_currency = True
 
         reconciliation_status = "UNVERIFIED"
@@ -331,30 +378,73 @@ class MultiSourceReconciliationEngine:
         variance_reason = None
         finding: Optional[Finding] = None
 
-        # Check for unreadable / degraded documents first
-        unverified_doc = next((d for d in [po_doc] + invoice_docs + receipt_docs if d and d.extraction_status == "UNVERIFIED"), None)
-        if unverified_doc:
+        if unverified_billing_doc:
             reconciliation_status = "UNVERIFIED"
             requires_review = True
-            review_reason = f"Document '{unverified_doc.filename}' extraction is unverified due to optical degradation or ink smudge."
+            is_untrusted = (unverified_billing_doc.extracted_data or {}).get("provenance", {}).get("extraction_method") == "UNTRUSTED_SIDECAR"
+            if is_untrusted:
+                review_reason = f"Document '{unverified_billing_doc.filename}' relies on untrusted companion sidecar metadata and requires human verification."
+                finding_title = "Untrusted Metadata - Document Requires Human Verification"
+                finding_explanation = "Source document lacks directly verified machine text. Data extracted from companion sidecar is untrusted until verified by an auditor."
+                rationale = "Classified as UNVERIFIED because companion JSON sidecar is untrusted metadata requiring independent human verification."
+            else:
+                review_reason = f"Document '{unverified_billing_doc.filename}' extraction is unverified due to optical degradation or ink smudge."
+                finding_title = "Optical Degradation - Unverified Source Document"
+                finding_explanation = "Source document contains smudged or unreadable text. Amount remains unverified."
+                rationale = "Classified as UNVERIFIED because source text quality is below audit threshold."
+
             finding = Finding(
                 investigation_id=investigation_id,
-                title="Optical Degradation - Unverified Source Document",
+                title=finding_title,
                 classification="UNVERIFIED",
-                subject_reference=unverified_doc.filename,
-                source_paths=[unverified_doc.file_path],
+                subject_reference=unverified_billing_doc.filename,
+                source_paths=[unverified_billing_doc.file_path],
                 expected_value="Readable financial amount & date",
-                observed_value="Smudged / unreadable optical text",
-                variance_explanation="Receipt photo contains smudged numbers and low resolution. Amount remains unverified.",
+                observed_value="Untrusted or smudged optical text",
+                variance_explanation=finding_explanation,
                 recommended_action="Obtain high-resolution scan or manual confirmation from field team.",
-                source_document_ids=[unverified_doc.id],
-                extracted_fields_used={"filename": unverified_doc.filename, "extraction_status": "UNVERIFIED"},
+                source_document_ids=[unverified_billing_doc.id],
+                extracted_fields_used={"filename": unverified_billing_doc.filename, "extraction_status": "UNVERIFIED"},
                 comparison_details={"status": "unverified_scan"},
-                evidence_limitations="Optical degradation prevents reliable OCR or vision extraction.",
-                missing_evidence_details="Legible high-resolution re-scan.",
-                classification_rationale="Classified as UNVERIFIED because source text quality is below audit threshold."
+                evidence_limitations="Optical degradation or unverified companion metadata prevents certified reconciliation.",
+                missing_evidence_details="Legible high-resolution re-scan or signed human audit voucher.",
+                classification_rationale=rationale
             )
-            finding.documents = [unverified_doc]
+            finding.documents = [unverified_billing_doc]
+
+        elif not po_doc and not invoice_docs and unverified_receipt_doc:
+            reconciliation_status = "UNVERIFIED"
+            requires_review = True
+            is_untrusted = (unverified_receipt_doc.extracted_data or {}).get("provenance", {}).get("extraction_method") == "UNTRUSTED_SIDECAR"
+            if is_untrusted:
+                review_reason = f"Receipt '{unverified_receipt_doc.filename}' relies on untrusted companion sidecar metadata and requires human verification."
+                finding_title = "Untrusted Metadata - Receipt Requires Human Verification"
+                finding_explanation = "Receipt lacks directly verified machine text. Data extracted from companion sidecar is untrusted until verified by an auditor."
+                rationale = "Classified as UNVERIFIED because companion JSON sidecar is untrusted metadata requiring independent human verification."
+            else:
+                review_reason = f"Receipt '{unverified_receipt_doc.filename}' extraction is unverified due to optical degradation or ink smudge."
+                finding_title = "Optical Degradation - Unverified Payment Receipt"
+                finding_explanation = "Payment receipt contains smudged or unreadable text. Disbursement amount remains unverified."
+                rationale = "Classified as UNVERIFIED because source text quality is below audit threshold."
+
+            finding = Finding(
+                investigation_id=investigation_id,
+                title=finding_title,
+                classification="UNVERIFIED",
+                subject_reference=unverified_receipt_doc.filename,
+                source_paths=[unverified_receipt_doc.file_path],
+                expected_value="Readable disbursement amount & date",
+                observed_value="Untrusted or smudged optical text",
+                variance_explanation=finding_explanation,
+                recommended_action="Obtain high-resolution scan or manual confirmation from field team.",
+                source_document_ids=[unverified_receipt_doc.id],
+                extracted_fields_used={"filename": unverified_receipt_doc.filename, "extraction_status": "UNVERIFIED"},
+                comparison_details={"status": "unverified_scan"},
+                evidence_limitations="Optical degradation or unverified companion metadata prevents certified reconciliation.",
+                missing_evidence_details="Legible high-resolution re-scan or signed human audit voucher.",
+                classification_rationale=rationale
+            )
+            finding.documents = [unverified_receipt_doc]
 
         # DEF-01: Missing or Invalid Currency
         elif has_missing_currency:
@@ -422,6 +512,7 @@ class MultiSourceReconciliationEngine:
             variance_reason = "Disbursement receipt has no corresponding invoice or purchase order in scoped folder."
             requires_review = True
             review_reason = "Unapplied payment receipt. Supporting commercial invoice or purchase order authorization was not located."
+            paid_disp = f"{total_paid:.2f} {curr_display}" if total_paid is not None else f"[UNVERIFIED AMOUNT] {curr_display}"
             finding = Finding(
                 investigation_id=investigation_id,
                 title="Disbursement Receipt Without Supporting Invoice or Purchase Order",
@@ -429,9 +520,9 @@ class MultiSourceReconciliationEngine:
                 subject_reference=rec_ref_str,
                 source_paths=all_paths,
                 expected_value="Commercial Invoice and Approved Purchase Order",
-                observed_value=f"Disbursement receipt of {total_paid:.2f} {curr_display} with no corresponding invoice or PO in scoped folder",
+                observed_value=f"Disbursement receipt of {paid_disp} with no corresponding invoice or PO in scoped folder",
                 variance_explanation=(
-                    f"Payment receipt {rec_ref_str} ({total_paid:.2f} {curr_display}) was discovered without an identifiable "
+                    f"Payment receipt {rec_ref_str} ({paid_disp}) was discovered without an identifiable "
                     f"commercial invoice or authorizing purchase order within the scoped directory '{target_scope}'. "
                     "Note: This records that supporting authorization was not located in this repository; it does not claim "
                     "that the payment was unauthorized or that improper expenditure occurred."
@@ -445,6 +536,54 @@ class MultiSourceReconciliationEngine:
                 classification_rationale="Classified as MISSING_EVIDENCE because donor compliance requires supporting commercial documentation for disbursements."
             )
             finding.documents = receipt_docs
+
+        # Case: Billed Amount Exceeds PO Authorization (Discrepancy Check)
+        # Evaluated before missing receipt to prevent incomplete companion evidence from downgrading verified overbilling
+        elif po_amt and total_billed and round(total_billed - po_amt, 2) > 0.01:
+            diff = round(total_billed - po_amt, 2)
+            # Check if covered by approved variations
+            if approved_var_sum > 0 and abs(diff - approved_var_sum) < 0.01:
+                reconciliation_status = "RECONCILED_WITH_VARIATION"
+                variance_amt = approved_var_sum
+                variance_reason = f"Billed excess (+{approved_var_sum:.2f} {curr_display}) is substantiated by approved variation orders."
+            else:
+                reconciliation_status = "VARIANCE_HOLD"
+                variance_amt = diff
+                variance_reason = f"Invoiced billing exceeds approved PO authorization by +{diff:.2f} {curr_display}."
+                requires_review = True
+                review_reason = "Unsubstantiated billing variance exceeding approved purchase order limit."
+                if not receipt_docs:
+                    review_reason += " Additionally, payment disbursement proof is missing."
+                elif unverified_receipt_doc:
+                    review_reason += " Additionally, companion payment receipt requires human verification."
+                finding = Finding(
+                    investigation_id=investigation_id,
+                    title="Billed Amount Exceeds Purchase Order Authorization",
+                    classification="CONFIRMED_DISCREPANCY",
+                    subject_reference=f"{po_ref} / {inv_ref_str}",
+                    source_paths=all_paths,
+                    expected_value=f"PO Authorization: {po_amt:.2f} {curr_display}",
+                    observed_value=f"Invoiced Billing: {total_billed:.2f} {curr_display} (+{diff:.2f} variance)",
+                    variance_explanation=(
+                        f"Invoice {inv_ref_str} bills {total_billed:.2f} {curr_display}, exceeding the approved "
+                        f"purchase order {po_ref} ({po_amt:.2f} {curr_display}) by {diff:.2f} {curr_display}. "
+                        "Exhaustive search of authorized project repository confirmed no formal amendment or variation order exists."
+                    ),
+                    recommended_action="Procurement officer must confirm whether an approved PO amendment was issued outside this repository.",
+                    source_document_ids=all_doc_ids,
+                    extracted_fields_used={"po_reference": po_ref, "po_amount": po_amt, "invoice_amount": total_billed, "currency": currency},
+                    comparison_details={
+                        "po_authorized_amount": po_amt,
+                        "invoiced_amount": total_billed,
+                        "unauthorized_variance": diff,
+                        "currency": currency,
+                        "calculation": f"{total_billed:.2f} - {po_amt:.2f} = +{diff:.2f} {curr_display}"
+                    },
+                    evidence_limitations=f"Scoped strictly to project directory '{target_scope}'.",
+                    missing_evidence_details="No approved contract variation order or PO amendment exists within the scoped repository.",
+                    classification_rationale="Classified as CONFIRMED_DISCREPANCY because all scoped evidence was verified and no authorizing amendment covers the variance."
+                )
+                finding.documents = [d for d in [po_doc] + invoice_docs if d]
 
         # Case: Missing Receipt (Billed without payment proof) - Check this before missing PO
         elif invoice_docs and not receipt_docs:
@@ -502,49 +641,6 @@ class MultiSourceReconciliationEngine:
                 classification_rationale="Classified as MISSING_EVIDENCE because commercial commitments require prior PO authorization."
             )
             finding.documents = invoice_docs
-
-        # Case: Billed Amount Exceeds PO Authorization (Discrepancy Check)
-        elif po_amt and total_billed and round(total_billed - po_amt, 2) > 0.01:
-            diff = round(total_billed - po_amt, 2)
-            # Check if covered by approved variations
-            if approved_var_sum > 0 and abs(diff - approved_var_sum) < 0.01:
-                reconciliation_status = "RECONCILED_WITH_VARIATION"
-                variance_amt = approved_var_sum
-                variance_reason = f"Billed excess (+{approved_var_sum:.2f} {curr_display}) is substantiated by approved variation orders."
-            else:
-                reconciliation_status = "VARIANCE_HOLD"
-                variance_amt = diff
-                variance_reason = f"Invoiced billing exceeds approved PO authorization by +{diff:.2f} {curr_display}."
-                requires_review = True
-                review_reason = "Unsubstantiated billing variance exceeding approved purchase order limit."
-                finding = Finding(
-                    investigation_id=investigation_id,
-                    title="Billed Amount Exceeds Purchase Order Authorization",
-                    classification="CONFIRMED_DISCREPANCY",
-                    subject_reference=f"{po_ref} / {inv_ref_str}",
-                    source_paths=all_paths,
-                    expected_value=f"PO Authorization: {po_amt:.2f} {curr_display}",
-                    observed_value=f"Invoiced Billing: {total_billed:.2f} {curr_display} (+{diff:.2f} variance)",
-                    variance_explanation=(
-                        f"Invoice {inv_ref_str} bills {total_billed:.2f} {curr_display}, exceeding the approved "
-                        f"purchase order {po_ref} ({po_amt:.2f} {curr_display}) by {diff:.2f} {curr_display}. "
-                        "Exhaustive search of authorized project repository confirmed no formal amendment or variation order exists."
-                    ),
-                    recommended_action="Procurement officer must confirm whether an approved PO amendment was issued outside this repository.",
-                    source_document_ids=all_doc_ids,
-                    extracted_fields_used={"po_reference": po_ref, "po_amount": po_amt, "invoice_amount": total_billed, "currency": currency},
-                    comparison_details={
-                        "po_authorized_amount": po_amt,
-                        "invoiced_amount": total_billed,
-                        "unauthorized_variance": diff,
-                        "currency": currency,
-                        "calculation": f"{total_billed:.2f} - {po_amt:.2f} = +{diff:.2f} {curr_display}"
-                    },
-                    evidence_limitations=f"Scoped strictly to project directory '{target_scope}'.",
-                    missing_evidence_details="No approved contract variation order or PO amendment exists within the scoped repository.",
-                    classification_rationale="Classified as CONFIRMED_DISCREPANCY because all scoped evidence was verified and no authorizing amendment covers the variance."
-                )
-                finding.documents = [d for d in [po_doc] + invoice_docs if d]
 
         # DEF-02: Overpayment Check (Supported Disbursements Exceed Invoiced Billing)
         elif total_billed and total_paid and round(total_paid - total_billed, 2) > 0.01:
@@ -709,6 +805,46 @@ class MultiSourceReconciliationEngine:
         elif po_amt and total_billed and total_paid and abs(po_amt - total_billed) < 0.01 and abs(total_billed - total_paid) < 0.01:
             reconciliation_status = "RECONCILED_MATCH"
             confidence = "EXACT_MATCH"
+
+        # Check if an unverified receipt exists in this group
+        if unverified_receipt_doc:
+            requires_review = True
+            is_untrusted = (unverified_receipt_doc.extracted_data or {}).get("provenance", {}).get("extraction_method") == "UNTRUSTED_SIDECAR"
+            if is_untrusted:
+                review_reason = f"Receipt '{unverified_receipt_doc.filename}' relies on untrusted companion sidecar metadata and requires human verification."
+                f_title = "Untrusted Metadata - Document Requires Human Verification"
+                f_exp = "Source document lacks directly verified machine text. Data extracted from companion sidecar is untrusted until verified by an auditor."
+                f_rat = "Classified as UNVERIFIED because companion JSON sidecar is untrusted metadata requiring independent human verification."
+            else:
+                review_reason = f"Receipt '{unverified_receipt_doc.filename}' extraction is unverified due to optical degradation or ink smudge."
+                f_title = "Optical Degradation - Unverified Source Document"
+                f_exp = "Receipt photo contains smudged numbers and low resolution. Amount remains unverified."
+                f_rat = "Classified as UNVERIFIED because source text quality is below audit threshold."
+
+            # An unverified receipt cannot confirm disbursement
+            total_paid = None
+
+            # If no billing discrepancy finding was created (e.g. PO and Invoice matched), create the unverified receipt finding
+            if finding is None:
+                reconciliation_status = "UNVERIFIED"
+                finding = Finding(
+                    investigation_id=investigation_id,
+                    title=f_title,
+                    classification="UNVERIFIED",
+                    subject_reference=unverified_receipt_doc.filename,
+                    source_paths=[unverified_receipt_doc.file_path],
+                    expected_value="Readable financial amount & date",
+                    observed_value="Untrusted or smudged optical text",
+                    variance_explanation=f_exp,
+                    recommended_action="Obtain high-resolution scan or manual confirmation from field team.",
+                    source_document_ids=[unverified_receipt_doc.id],
+                    extracted_fields_used={"filename": unverified_receipt_doc.filename, "extraction_status": "UNVERIFIED"},
+                    comparison_details={"status": "unverified_scan"},
+                    evidence_limitations="Optical degradation or unverified companion metadata prevents certified reconciliation.",
+                    missing_evidence_details="Legible high-resolution re-scan or signed human audit voucher.",
+                    classification_rationale=f_rat
+                )
+                finding.documents = [unverified_receipt_doc]
 
         # DEF-04: Credit note check adjustment note
         if has_credit_notes:
